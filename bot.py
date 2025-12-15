@@ -1,18 +1,16 @@
-import os, asyncio, threading, random, logging
+import os
+import logging
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
-from models import db, Ayah
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from models import db, Ayah, User
 
-# ================= LOG =================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ================= FLASK =================
+# ================= Flask Setup ================= #
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "secret-key")
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db.init_app(app)
@@ -20,219 +18,98 @@ db.init_app(app)
 with app.app_context():
     db.create_all()
 
-# ================= ENV =================
+# ================= Bot Config ================= #
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = str(os.environ.get("ADMIN_ID"))
-PORT = int(os.environ.get("PORT", 5000))
+ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 
-# Render webhook auto
-RENDER_HOST = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-WEBHOOK_URL = f"https://{RENDER_HOST}/webhook" if RENDER_HOST else None
-
-application = None
-loop = None
-
-# ================= HELPERS =================
-def save_ayah_auto(uid, sura, ayah, text, audio, channel, msg_id):
+# ================= Helper Functions ================= #
+def save_ayah(ayah_id, text, audio_file_id):
     with app.app_context():
-        if Ayah.query.filter_by(ayah_uid=uid).first():
-            return False
-        db.session.add(
-            Ayah(
-                ayah_uid=uid,
-                sura=sura,
-                ayah_number=ayah,
-                text=text,
-                audio_file_id=audio,
-                channel_id=channel,
-                message_id=msg_id
-            )
-        )
+        existing = Ayah.query.filter_by(ayah_id=ayah_id).first()
+        if existing:
+            existing.text = text
+            existing.audio_file_id = audio_file_id
+        else:
+            ayah = Ayah(ayah_id=ayah_id, text=text, audio_file_id=audio_file_id)
+            db.session.add(ayah)
         db.session.commit()
-        return True
 
-def get_random_ayah():
+def register_user(user):
     with app.app_context():
-        count = Ayah.query.count()
-        if count == 0:
-            return None
-        return Ayah.query.offset(random.randint(0, count - 1)).first()
+        if not User.query.filter_by(user_id=user.id).first():
+            u = User(
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name
+            )
+            db.session.add(u)
+            db.session.commit()
 
-def search_ayah(q):
+def get_user_count():
     with app.app_context():
-        return Ayah.query.filter(
-            Ayah.sura.ilike(f"%{q}%") |
-            Ayah.text.ilike(f"%{q}%")
-        ).limit(10).all()
+        return User.query.count()
 
-# ================= USER COMMANDS =================
+def get_ayah_count():
+    with app.app_context():
+        return Ayah.query.count()
+
+# ================= Handlers ================= #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "╔════════════════════╗\n"
-        "🕋 <b>QUR'ON BOT</b>\n"
-        "╚════════════════════╝\n\n"
-        "📖 Oyatlar va qiroatlar\n"
-        "🔍 Sura yoki oyat nomini yozing\n\n"
-        "💎 Premium Qur'on xizmati"
-    )
-    kb = [[InlineKeyboardButton("🎲 Tasodifiy oyat", callback_data="rnd")]]
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    user = update.effective_user
+    register_user(user)
 
-async def random_ayah(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ayah = get_random_ayah()
-    if not ayah:
-        await update.message.reply_text("❌ Oyatlar yo‘q")
-        return
+    keyboard = [
+        [InlineKeyboardButton("📊 Statistika", callback_data="stats")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    caption = (
-        f"🕋 <b>{ayah.sura}</b>\n"
-        f"📖 Oyat: <b>{ayah.ayah_number}</b>\n\n"
-        f"{ayah.text or ''}"
-    )
+    text = "🌟 Assalomu alaykum!\n\nFoydalanuvchilar faqat admin tomonidan qo‘shilishi mumkin."
+    await update.message.reply_text(text, reply_markup=reply_markup)
 
-    if ayah.audio_file_id:
-        await context.bot.send_audio(
-            update.effective_chat.id,
-            ayah.audio_file_id,
-            caption=caption,
-            parse_mode="HTML"
-        )
-    else:
-        await update.message.reply_text(caption, parse_mode="HTML")
-
-async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.message.text.strip()
-    if len(q) < 2:
-        return
-    res = search_ayah(q)
-    if not res:
-        await update.message.reply_text("❌ Topilmadi")
-        return
-
-    kb = [[InlineKeyboardButton(
-        f"{a.sura} ({a.ayah_number})",
-        callback_data=a.ayah_uid
-    )] for a in res]
-
-    await update.message.reply_text(
-        "🔍 <b>QIDIRUV</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-# ================= CALLBACK =================
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "rnd":
-        await random_ayah(q, context)
-        return
-
-    with app.app_context():
-        ayah = Ayah.query.filter_by(ayah_uid=q.data).first()
-
-    if not ayah:
-        await q.edit_message_text("❌ Topilmadi")
-        return
-
-    text = (
-        f"🕋 <b>{ayah.sura}</b>\n"
-        f"📖 Oyat: <b>{ayah.ayah_number}</b>\n\n"
-        f"{ayah.text or ''}"
-    )
-
-    if ayah.audio_file_id:
-        await context.bot.send_audio(
-            q.message.chat.id,
-            ayah.audio_file_id,
-            caption=text,
-            parse_mode="HTML"
-        )
-    else:
-        await q.message.reply_text(text, parse_mode="HTML")
-
-# ================= ADMIN AUTO INDEX =================
-async def auto_index(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⚠️ Siz admin emassiz!")
         return
 
     msg = update.message
-    origin = msg.forward_origin
-    if not origin or not hasattr(origin, "chat"):
+    ayah_id = msg.caption
+    audio_file_id = msg.audio.file_id if msg.audio else None
+
+    if not ayah_id or not audio_file_id:
+        await msg.reply_text("⚠️ Caption bo‘sh yoki audio mavjud emas.")
         return
 
-    # Caption format: SURA|OYAT
-    caption = msg.caption or ""
-    if "|" not in caption:
-        await msg.reply_text("❌ Caption: SURA|OYAT")
-        return
+    save_ayah(ayah_id, msg.caption, audio_file_id)
+    await msg.reply_text(f"✅ Oyat saqlandi: {ayah_id}\n📊 Foydalanuvchilar: {get_user_count()}")
 
-    sura, ayah = caption.split("|", 1)
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "stats":
+        total_ayahs = get_ayah_count()
+        total_users = get_user_count()
+        await query.edit_message_text(f"📊 Statistika:\nOyatlar: {total_ayahs}\nFoydalanuvchilar: {total_users}")
 
-    text = msg.text or ""
-    audio = msg.audio.file_id if msg.audio else None
-
-    uid = f"{origin.chat.id}_{origin.message_id}"
-
-    ok = save_ayah_auto(
-        uid,
-        sura.strip(),
-        ayah.strip(),
-        text.strip(),
-        audio,
-        str(origin.chat.id),
-        str(origin.message_id)
-    )
-
-    if ok:
-        await msg.reply_text("✅ Oyat avtomatik indexlandi")
-    else:
-        await msg.reply_text("⚠️ Bu oyat avval qo‘shilgan")
-
-# ================= INIT =================
-def create_bot():
-    bot = Application.builder().token(BOT_TOKEN).build()
-    bot.add_handler(CommandHandler("start", start))
-    bot.add_handler(CommandHandler("random", random_ayah))
-    bot.add_handler(CallbackQueryHandler(callbacks))
-    bot.add_handler(MessageHandler(filters.FORWARDED, auto_index))
-    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
-    return bot
-
-async def run_bot():
-    global application
-    application = create_bot()
-    await application.initialize()
-    await application.start()
-
-    if WEBHOOK_URL:
-        await application.bot.set_webhook(WEBHOOK_URL)
-
-    while True:
-        await asyncio.sleep(3600)
-
-def start_bot():
-    def r():
-        global loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_bot())
-    threading.Thread(target=r, daemon=True).start()
-
-# ================= WEBHOOK =================
-@app.route("/webhook", methods=["POST"])
+# ================= Telegram Webhook ================= #
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.json, application.bot)
-    asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put(update)
     return "ok"
 
-@app.route("/")
-def index():
-    return "🕋 Qur'on bot ishlayapti"
+# ================= Main ================= #
+def main():
+    global application
+    application = Application.builder().token(BOT_TOKEN).build()
 
-if BOT_TOKEN:
-    start_bot()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.ALL & filters.FORWARDED, handle_forward))
+    application.add_handler(CallbackQueryHandler(callback_query_handler))
+
+    # Flask app uchun webhook
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 if __name__ == "__main__":
-    app.run("0.0.0.0", PORT)
+    main()
